@@ -71,15 +71,15 @@ app.get('/', (c) => {
 </style>
 </head>
 <body>
-<div class="header"><h1>🔥 KiraEnterpriseV5.3</h1><p>Sistem Perakaunan Standard Malaysia (MPERS)</p></div>
+<div class="header"><h1>🔥 KiraEnterpriseV5.3</h1><p>Sistem Perakaun Standard Malaysia (MPERS)</p></div>
 <div class="nav">
-  <button class="active" onclick="showSection('dashboard', event)">📊 Papan Pemuka</button>
-  <button onclick="showSection('coa', event)">📑 Carta Akaun</button>
-  <button onclick="showSection('journal', event)">📝 Jurnal</button>
-  <button onclick="showSection('ledger', event)">📖 Lejar Am</button>
-  <button onclick="showSection('tb', event)">⚖️ Imbangan Duga</button>
-  <button onclick="showSection('pl', event)">📈 Untung Rugi</button>
-  <button onclick="showSection('bs', event)">📋 Kunci Kira-kira</button>
+  <button class="active" onclick="showSection('dashboard')"> Papan Pemuka</button>
+  <button onclick="showSection('coa')">📑 Carta Akaun</button>
+  <button onclick="showSection('journal')">📝 Jurnal</button>
+  <button onclick="showSection('ledger')">📖 Lejar Am</button>
+  <button onclick="showSection('tb')">⚖️ Imbangan Duga</button>
+  <button onclick="showSection('pl')">📈 Untung Rugi</button>
+  <button onclick="showSection('bs')">📋 Kunci Kira-kira</button>
 </div>
 <div class="container">
   <div id="dashboard" class="section active">
@@ -124,11 +124,11 @@ app.get('/', (c) => {
 <script>
 const coa = ${JSON.stringify(chartOfAccounts)};
 
-function showSection(id, evt) {
+function showSection(id) {
   document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
   document.querySelectorAll('.nav button').forEach(b => b.classList.remove('active'));
   document.getElementById(id).classList.add('active');
-  if(evt && evt.target) evt.target.classList.add('active');
+  event.target.classList.add('active');
   if(id === 'dashboard') loadCompanies();
   if(id === 'coa') loadCOA();
   if(id === 'journal') { loadJournals(); populateSelects(); }
