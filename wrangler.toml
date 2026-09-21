@@ -6,3 +6,12 @@ compatibility_date = "2024-09-18"
 binding = "DB"
 database_name = "mykira"
 database_id = "4037f2cd-0c4a-4251-846e-534eb7b47338"
+
+# e-Invois database (read-only source for auto-derived journals).
+# Companies whose name matches an e-Invois seller get journals derived
+# automatically at read time — no duplicate writes into mykira.
+[[d1_databases]]
+binding = "EINVOIS"
+database_name = "einvois-db"
+database_id = "36e6ad4d-a715-4f2b-8b4a-70ecc5c05fde"
+

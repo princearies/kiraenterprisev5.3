@@ -37,6 +37,93 @@ const chartOfAccounts = {
   '6004': { name: 'Susut Nilai', type: 'expense', category: 'operating' },
 };
 
+// ==================== E-INVOIS AUTO JOURNALS (DERIVED AT READ TIME) ====================
+// Companies whose name matches an e-Invois seller get their sales journals
+// derived automatically from the e-Invois D1 database (binding: EINVOIS).
+// No duplicate data is written into mykira. Companies without e-Invois
+// continue to use manual journal entries only.
+//
+// Sale journal (invoice issued):     Dr 1003 Akaun Belum Terima = total
+//                                    Cr 4001 Jualan            = subtotal
+//                                    Cr 2005 SST               = sst
+// Receipt journal (invoice paid):    Dr 1002 Bank              = total
+//                                    Cr 1003 Akaun Belum Terima = total
+
+function toLines(row) {
+  try {
+    return typeof row.lines === 'string' ? JSON.parse(row.lines) : (row.lines || []);
+  } catch (e) { return []; }
+}
+
+async function getDerivedJournals(einvoisDb, db, companyCode) {
+  if (!einvoisDb || !companyCode) return [];
+  try {
+    // Resolve the company's name in Kira, then match e-Invois sellers by name
+    const co = await db.prepare('SELECT entity_name FROM client_entries WHERE client_id = ?').bind(companyCode).first();
+    if (!co || !co.entity_name) return [];
+    const { results } = await einvoisDb.prepare(`
+      SELECT id, invoice_no, date, buyer, subtotal, sst, total, status
+      FROM invoices
+      WHERE LOWER(json_extract(seller, '$.name')) = LOWER(?)
+      ORDER BY date
+    `).bind(co.entity_name).all();
+
+    const journals = [];
+    for (const inv of results) {
+      let buyerName = 'Pelanggan';
+      try { buyerName = JSON.parse(inv.buyer).name || 'Pelanggan'; } catch (e) {}
+      const saleLines = [
+        { account: '1003', accountName: 'Akaun Belum Terima (Debtor)', debit: inv.total, credit: 0 },
+        { account: '4001', accountName: 'Jualan', debit: 0, credit: inv.subtotal },
+      ];
+      if (Number(inv.sst) > 0) {
+        saleLines.push({ account: '2005', accountName: 'SST', debit: 0, credit: inv.sst });
+      }
+      journals.push({
+        id: 'einv-sale-' + inv.id,
+        company_id: companyCode,
+        client_id: companyCode,
+        date: inv.date,
+        description: '[e-Invois] Invois ' + inv.invoice_no + ' - ' + buyerName,
+        lines: saleLines,
+        source: 'e-invois',
+      });
+      if (inv.status === 'paid') {
+        journals.push({
+          id: 'einv-pay-' + inv.id,
+          company_id: companyCode,
+          client_id: companyCode,
+          date: inv.date,
+          description: '[e-Invois] Bayaran Invois ' + inv.invoice_no + ' - ' + buyerName,
+          lines: [
+            { account: '1002', accountName: 'Bank', debit: inv.total, credit: 0 },
+            { account: '1003', accountName: 'Akaun Belum Terima (Debtor)', debit: 0, credit: inv.total },
+          ],
+          source: 'e-invois',
+        });
+      }
+    }
+    return journals;
+  } catch (e) {
+    // e-Invois DB unavailable or schema missing — fall back to manual-only
+    console.error('e-Invois derivation failed:', e.message);
+    return [];
+  }
+}
+
+// Merge manual journals (mykira) + derived e-Invois journals, oldest first.
+// Used by the journal list and all report endpoints.
+async function getAllJournals(c, companyCode) {
+  let q = 'SELECT * FROM journal_entries';
+  const params = [];
+  if (companyCode) { q += ' WHERE company_id = ?'; params.push(companyCode); }
+  q += ' ORDER BY date';
+  const { results } = await c.env.DB.prepare(q).bind(...params).all();
+  const manual = results.map(r => ({ ...r, lines: toLines(r), source: 'manual' }));
+  const derived = await getDerivedJournals(c.env.EINVOIS, c.env.DB, companyCode);
+  return [...manual, ...derived];
+}
+
 // ==================== SERVE UI ====================
 app.get('/', (c) => {
   return c.html(`<!DOCTYPE html>
@@ -297,23 +384,20 @@ app.post('/api/journal-entries', async (c) => {
 app.get('/api/journal-entries', async (c) => {
   try {
     const code = c.req.query('company_code');
-    let q = 'SELECT * FROM journal_entries';
-    const params = [];
-    if(code) { q += ' WHERE company_id = ?'; params.push(code); }
-    q += ' ORDER BY date DESC';
-    const { results } = await c.env.DB.prepare(q).bind(...params).all();
-    return c.json({ success: true, data: results.map(r => ({...r, lines: JSON.parse(r.lines)})) });
+    const all = await getAllJournals(c, code);
+    // newest first for display
+    all.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+    return c.json({ success: true, data: all });
   } catch (e) { return c.json({ success: false, error: e.message }, 500); }
 });
 
 app.get('/api/reports/ledger', async (c) => {
   try {
     const code = c.req.query('company_code');
-    const { results } = await c.env.DB.prepare('SELECT * FROM journal_entries WHERE company_id = ? ORDER BY date').bind(code).all();
+    const all = await getAllJournals(c, code);
     const ledger = {};
-    results.forEach(r => {
-      const lines = JSON.parse(r.lines);
-      lines.forEach(l => {
+    all.forEach(r => {
+      toLines(r).forEach(l => {
         if(!ledger[l.account]) ledger[l.account] = [];
         ledger[l.account].push({ date: r.date, desc: r.description, debit: l.debit, credit: l.credit });
       });
@@ -325,10 +409,10 @@ app.get('/api/reports/ledger', async (c) => {
 app.get('/api/reports/trial-balance', async (c) => {
   try {
     const code = c.req.query('company_code');
-    const { results } = await c.env.DB.prepare('SELECT lines FROM journal_entries WHERE company_id = ?').bind(code).all();
+    const all = await getAllJournals(c, code);
     const tb = {};
-    results.forEach(r => {
-      JSON.parse(r.lines).forEach(l => {
+    all.forEach(r => {
+      toLines(r).forEach(l => {
         if(!tb[l.account]) tb[l.account] = { debit: 0, credit: 0 };
         tb[l.account].debit += Number(l.debit||0);
         tb[l.account].credit += Number(l.credit||0);
@@ -341,11 +425,11 @@ app.get('/api/reports/trial-balance', async (c) => {
 app.get('/api/reports/profit-loss', async (c) => {
   try {
     const code = c.req.query('company_code');
-    const { results } = await c.env.DB.prepare('SELECT lines FROM journal_entries WHERE company_id = ?').bind(code).all();
+    const all = await getAllJournals(c, code);
     const revenue = {}, expenses = {};
     let totalRev = 0, totalExp = 0;
-    results.forEach(r => {
-      JSON.parse(r.lines).forEach(l => {
+    all.forEach(r => {
+      toLines(r).forEach(l => {
         const acc = chartOfAccounts[l.account];
         if(acc) {
           if(acc.type === 'revenue') { revenue[l.account] = (revenue[l.account]||0) + (l.credit - l.debit); totalRev += (l.credit - l.debit); }
@@ -360,11 +444,11 @@ app.get('/api/reports/profit-loss', async (c) => {
 app.get('/api/reports/balance-sheet', async (c) => {
   try {
     const code = c.req.query('company_code');
-    const { results } = await c.env.DB.prepare('SELECT lines FROM journal_entries WHERE company_id = ?').bind(code).all();
+    const all = await getAllJournals(c, code);
     const assets = {}, liabilities = {}, equity = {};
     let totalAssets = 0, totalLiabEquity = 0;
-    results.forEach(r => {
-      JSON.parse(r.lines).forEach(l => {
+    all.forEach(r => {
+      toLines(r).forEach(l => {
         const acc = chartOfAccounts[l.account];
         if(acc) {
           const bal = l.debit - l.credit;
@@ -376,8 +460,8 @@ app.get('/api/reports/balance-sheet', async (c) => {
     });
     // Add Net Profit to Equity
     let totalRev = 0, totalExp = 0;
-    results.forEach(r => {
-      JSON.parse(r.lines).forEach(l => {
+    all.forEach(r => {
+      toLines(r).forEach(l => {
         const acc = chartOfAccounts[l.account];
         if(acc) {
           if(acc.type === 'revenue') totalRev += (l.credit - l.debit);
