@@ -457,7 +457,17 @@ loadCompanies();
 // ==================== API ENDPOINTS ====================
 app.get('/api/clients', async (c) => {
   try {
-    const { results } = await c.env.DB.prepare(`SELECT client_id, entity_name, entity_type, status, COALESCE(json_extract(company_meta, '$.revenue'), 0) AS revenue, COALESCE(json_extract(company_meta, '$.expenses'), 0) AS expenses FROM client_entries ORDER BY client_id`).all();
+    const { results } = await c.env.DB.prepare(`
+      SELECT 
+        id AS client_id,
+        name AS entity_name,
+        'sdn_bhd' AS entity_type,
+        CASE WHEN is_active = 1 THEN 'active' ELSE 'inactive' END AS status,
+        0 AS revenue,
+        0 AS expenses
+      FROM companies 
+      ORDER BY id
+    `).all();
     return c.json({ success: true, data: results });
   } catch (e) { return c.json({ success: false, error: e.message }, 500); }
 });
