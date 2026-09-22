@@ -156,6 +156,9 @@ app.get('/', (c) => {
   .total-row { font-weight: bold; background: #e9ecef; }
   .section { display: none; }
   .section.active { display: block; }
+  textarea { font-family: 'Courier New', monospace; }
+  .m-result { background: #f8f9fa; padding: 12px; border-radius: 5px; border-left: 4px solid #28a745; margin-top:10px; font-family: monospace; font-size: 13px; white-space: pre-wrap; max-height: 400px; overflow-y: auto; }
+  .m-error { border-left-color: #dc3545; color: #dc3545; }
 </style>
 </head>
 <body>
@@ -168,6 +171,7 @@ app.get('/', (c) => {
   <button onclick="showSection('tb')">⚖️ Imbangan Duga</button>
   <button onclick="showSection('pl')">📈 Untung Rugi</button>
   <button onclick="showSection('bs')">📋 Kunci Kira-kira</button>
+  <button onclick="showSection('maintenance')">🔧 Maintenance</button>
 </div>
 <div class="container">
   <div id="dashboard" class="section active">
@@ -207,6 +211,19 @@ app.get('/', (c) => {
   <div id="bs" class="section">
     <div class="card"><h2>Kunci Kira-kira (Balance Sheet)</h2><div class="form-group"><label>Pilih Syarikat</label><select id="bs_company" onchange="loadBS()"></select></div><div id="bsList"></div></div>
   </div>
+  <div id="maintenance" class="section">
+    <div class="card">
+      <h2>🔧 Maintenance (Query Console)</h2>
+      <p style="margin-bottom:10px; color:#666;">Type any SQL query against the mykira database. Supports SELECT, INSERT, UPDATE, DELETE.</p>
+      <div class="form-group">
+        <label>SQL Query</label>
+        <textarea id="m_query" rows="8" style="width:100%; padding:10px; font-family:monospace; border:1px solid #ddd; border-radius:5px; font-size:13px;" placeholder="SELECT * FROM client_entries LIMIT 10;"></textarea>
+      </div>
+      <button class="btn" onclick="executeMaintenance()">▶ Run Query</button>
+      <button class="btn" style="background:#6c757d; margin-left:8px;" onclick="clearMaintenance()">🗑 Clear</button>
+      <div id="maintenanceResult"></div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -224,6 +241,7 @@ function showSection(id) {
   if(id === 'tb') populateCompanySelect('tb_company');
   if(id === 'pl') populateCompanySelect('pl_company');
   if(id === 'bs') populateCompanySelect('bs_company');
+  if(id === 'maintenance') { document.getElementById('m_query').value = ''; document.getElementById('maintenanceResult').innerHTML = ''; }
 }
 
 async function loadCompanies() {
@@ -357,6 +375,37 @@ async function loadBS() {
   for(let acc in data.equity) html += '<tr><td>'+(coa[acc]?.name||acc)+'</td><td style="text-align:right">RM '+data.equity[acc].toFixed(2)+'</td></tr>';
   html += '<tr class="total-row"><td>Jumlah Liabiliti & Ekuiti</td><td style="text-align:right">RM '+data.totalLiabEquity.toFixed(2)+'</td></tr></table></div></div>';
   document.getElementById('bsList').innerHTML = html;
+}
+
+async function executeMaintenance() {
+  const query = document.getElementById('m_query').value.trim();
+  if(!query) { alert('Masukkan query SQL!'); return; }
+  const res = await fetch('/api/maintenance/query', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ query }) });
+  const result = await res.json();
+  let html = '';
+  if(result.success) {
+    if(result.data && result.data.length > 0) {
+      const cols = Object.keys(result.data[0]);
+      html += '<table><tr>' + cols.map(c => '<th>'+c+'</th>').join('') + '</tr>';
+      result.data.forEach(row => {
+        html += '<tr>' + cols.map(c => '<td>'+(row[c]!==null&&row[c]!==undefined?row[c]:'')+'</td>').join('') + '</tr>';
+      });
+      html += '</table>';
+      html += '<p style="margin-top:8px; font-weight:bold; color:#2a5298;">Rows returned: '+result.data.length+' | Time: '+((result.time||0)+' ms')+'</p>';
+    } else if(result.affected !== undefined) {
+      html = '<div class="m-result">✅ Query executed successfully.<br>Rows affected: '+result.affected+' | Time: '+(result.time||0)+' ms</div>';
+    } else {
+      html = '<div class="m-result">✅ Query executed successfully. (No rows returned)<br>Time: '+(result.time||0)+' ms</div>';
+    }
+  } else {
+    html = '<div class="m-result m-error">❌ Error: '+result.error+'</div>';
+  }
+  document.getElementById('maintenanceResult').innerHTML = html;
+}
+
+function clearMaintenance() {
+  document.getElementById('m_query').value = '';
+  document.getElementById('maintenanceResult').innerHTML = '';
 }
 
 loadCompanies();
@@ -829,6 +878,37 @@ app.get('/api/companies/:code/summary', async (c) => {
 // ==================== UI: COMPANY REGISTRATION PAGE ====================
 app.get('/companies', (c) => {
   return c.html(companyPageHtml());
+});
+
+// ==================== MAINTENANCE / DEBUG ENDPOINT ====================
+// Execute arbitrary SQL queries against the mykira D1 database.
+// Supports SELECT, INSERT, UPDATE, DELETE and PRAGMA commands.
+
+app.post('/api/maintenance/query', async (c) => {
+  try {
+    const body = await c.req.json();
+    const query = String(body.query || '').trim();
+    if(!query) return c.json({ success: false, error: 'Query is empty' }, 400);
+
+    const upper = query.toUpperCase();
+    const isSelect = upper.startsWith('SELECT') || upper.startsWith('PRAGMA') || upper.startsWith('EXPLAIN');
+
+    const start = Date.now();
+    let data, affected;
+
+    if(isSelect) {
+      const { results } = await c.env.DB.prepare(query).all();
+      data = results;
+    } else {
+      const { success, changes } = await c.env.DB.prepare(query).run();
+      affected = changes;
+    }
+
+    const elapsed = Date.now() - start;
+    return c.json({ success: true, data: data || null, affected: affected ?? undefined, time: elapsed });
+  } catch (e) {
+    return c.json({ success: false, error: e.message }, 500);
+  }
 });
 
 export default app;
