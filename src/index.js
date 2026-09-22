@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
+import { companyPageHtml } from './companies-page';
 
 const app = new Hono();
 app.use('*', cors({ origin: '*', allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'], allowHeaders: ['Content-Type'] }));
@@ -36,6 +37,93 @@ const chartOfAccounts = {
   '6003': { name: 'Utiliti (Air/Elektrik)', type: 'expense', category: 'operating' },
   '6004': { name: 'Susut Nilai', type: 'expense', category: 'operating' },
 };
+
+// ==================== E-INVOIS AUTO JOURNALS (DERIVED AT READ TIME) ====================
+// Companies whose name matches an e-Invois seller get their sales journals
+// derived automatically from the e-Invois D1 database (binding: EINVOIS).
+// No duplicate data is written into mykira. Companies without e-Invois
+// continue to use manual journal entries only.
+//
+// Sale journal (invoice issued):     Dr 1003 Akaun Belum Terima = total
+//                                    Cr 4001 Jualan            = subtotal
+//                                    Cr 2005 SST               = sst
+// Receipt journal (invoice paid):    Dr 1002 Bank              = total
+//                                    Cr 1003 Akaun Belum Terima = total
+
+function toLines(row) {
+  try {
+    return typeof row.lines === 'string' ? JSON.parse(row.lines) : (row.lines || []);
+  } catch (e) { return []; }
+}
+
+async function getDerivedJournals(einvoisDb, db, companyCode) {
+  if (!einvoisDb || !companyCode) return [];
+  try {
+    // Resolve the company's name in Kira, then match e-Invois sellers by name
+    const co = await db.prepare('SELECT entity_name FROM client_entries WHERE client_id = ?').bind(companyCode).first();
+    if (!co || !co.entity_name) return [];
+    const { results } = await einvoisDb.prepare(`
+      SELECT id, invoice_no, date, buyer, subtotal, sst, total, status
+      FROM invoices
+      WHERE LOWER(json_extract(seller, '$.name')) = LOWER(?)
+      ORDER BY date
+    `).bind(co.entity_name).all();
+
+    const journals = [];
+    for (const inv of results) {
+      let buyerName = 'Pelanggan';
+      try { buyerName = JSON.parse(inv.buyer).name || 'Pelanggan'; } catch (e) {}
+      const saleLines = [
+        { account: '1003', accountName: 'Akaun Belum Terima (Debtor)', debit: inv.total, credit: 0 },
+        { account: '4001', accountName: 'Jualan', debit: 0, credit: inv.subtotal },
+      ];
+      if (Number(inv.sst) > 0) {
+        saleLines.push({ account: '2005', accountName: 'SST', debit: 0, credit: inv.sst });
+      }
+      journals.push({
+        id: 'einv-sale-' + inv.id,
+        company_id: companyCode,
+        client_id: companyCode,
+        date: inv.date,
+        description: '[e-Invois] Invois ' + inv.invoice_no + ' - ' + buyerName,
+        lines: saleLines,
+        source: 'e-invois',
+      });
+      if (inv.status === 'paid') {
+        journals.push({
+          id: 'einv-pay-' + inv.id,
+          company_id: companyCode,
+          client_id: companyCode,
+          date: inv.date,
+          description: '[e-Invois] Bayaran Invois ' + inv.invoice_no + ' - ' + buyerName,
+          lines: [
+            { account: '1002', accountName: 'Bank', debit: inv.total, credit: 0 },
+            { account: '1003', accountName: 'Akaun Belum Terima (Debtor)', debit: 0, credit: inv.total },
+          ],
+          source: 'e-invois',
+        });
+      }
+    }
+    return journals;
+  } catch (e) {
+    // e-Invois DB unavailable or schema missing — fall back to manual-only
+    console.error('e-Invois derivation failed:', e.message);
+    return [];
+  }
+}
+
+// Merge manual journals (mykira) + derived e-Invois journals, oldest first.
+// Used by the journal list and all report endpoints.
+async function getAllJournals(c, companyCode) {
+  let q = 'SELECT * FROM journal_entries';
+  const params = [];
+  if (companyCode) { q += ' WHERE company_id = ?'; params.push(companyCode); }
+  q += ' ORDER BY date';
+  const { results } = await c.env.DB.prepare(q).bind(...params).all();
+  const manual = results.map(r => ({ ...r, lines: toLines(r), source: 'manual' }));
+  const derived = await getDerivedJournals(c.env.EINVOIS, c.env.DB, companyCode);
+  return [...manual, ...derived];
+}
 
 // ==================== SERVE UI ====================
 app.get('/', (c) => {
@@ -297,23 +385,20 @@ app.post('/api/journal-entries', async (c) => {
 app.get('/api/journal-entries', async (c) => {
   try {
     const code = c.req.query('company_code');
-    let q = 'SELECT * FROM journal_entries';
-    const params = [];
-    if(code) { q += ' WHERE company_id = ?'; params.push(code); }
-    q += ' ORDER BY date DESC';
-    const { results } = await c.env.DB.prepare(q).bind(...params).all();
-    return c.json({ success: true, data: results.map(r => ({...r, lines: JSON.parse(r.lines)})) });
+    const all = await getAllJournals(c, code);
+    // newest first for display
+    all.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+    return c.json({ success: true, data: all });
   } catch (e) { return c.json({ success: false, error: e.message }, 500); }
 });
 
 app.get('/api/reports/ledger', async (c) => {
   try {
     const code = c.req.query('company_code');
-    const { results } = await c.env.DB.prepare('SELECT * FROM journal_entries WHERE company_id = ? ORDER BY date').bind(code).all();
+    const all = await getAllJournals(c, code);
     const ledger = {};
-    results.forEach(r => {
-      const lines = JSON.parse(r.lines);
-      lines.forEach(l => {
+    all.forEach(r => {
+      toLines(r).forEach(l => {
         if(!ledger[l.account]) ledger[l.account] = [];
         ledger[l.account].push({ date: r.date, desc: r.description, debit: l.debit, credit: l.credit });
       });
@@ -325,10 +410,10 @@ app.get('/api/reports/ledger', async (c) => {
 app.get('/api/reports/trial-balance', async (c) => {
   try {
     const code = c.req.query('company_code');
-    const { results } = await c.env.DB.prepare('SELECT lines FROM journal_entries WHERE company_id = ?').bind(code).all();
+    const all = await getAllJournals(c, code);
     const tb = {};
-    results.forEach(r => {
-      JSON.parse(r.lines).forEach(l => {
+    all.forEach(r => {
+      toLines(r).forEach(l => {
         if(!tb[l.account]) tb[l.account] = { debit: 0, credit: 0 };
         tb[l.account].debit += Number(l.debit||0);
         tb[l.account].credit += Number(l.credit||0);
@@ -341,11 +426,11 @@ app.get('/api/reports/trial-balance', async (c) => {
 app.get('/api/reports/profit-loss', async (c) => {
   try {
     const code = c.req.query('company_code');
-    const { results } = await c.env.DB.prepare('SELECT lines FROM journal_entries WHERE company_id = ?').bind(code).all();
+    const all = await getAllJournals(c, code);
     const revenue = {}, expenses = {};
     let totalRev = 0, totalExp = 0;
-    results.forEach(r => {
-      JSON.parse(r.lines).forEach(l => {
+    all.forEach(r => {
+      toLines(r).forEach(l => {
         const acc = chartOfAccounts[l.account];
         if(acc) {
           if(acc.type === 'revenue') { revenue[l.account] = (revenue[l.account]||0) + (l.credit - l.debit); totalRev += (l.credit - l.debit); }
@@ -360,11 +445,11 @@ app.get('/api/reports/profit-loss', async (c) => {
 app.get('/api/reports/balance-sheet', async (c) => {
   try {
     const code = c.req.query('company_code');
-    const { results } = await c.env.DB.prepare('SELECT lines FROM journal_entries WHERE company_id = ?').bind(code).all();
+    const all = await getAllJournals(c, code);
     const assets = {}, liabilities = {}, equity = {};
     let totalAssets = 0, totalLiabEquity = 0;
-    results.forEach(r => {
-      JSON.parse(r.lines).forEach(l => {
+    all.forEach(r => {
+      toLines(r).forEach(l => {
         const acc = chartOfAccounts[l.account];
         if(acc) {
           const bal = l.debit - l.credit;
@@ -376,8 +461,8 @@ app.get('/api/reports/balance-sheet', async (c) => {
     });
     // Add Net Profit to Equity
     let totalRev = 0, totalExp = 0;
-    results.forEach(r => {
-      JSON.parse(r.lines).forEach(l => {
+    all.forEach(r => {
+      toLines(r).forEach(l => {
         const acc = chartOfAccounts[l.account];
         if(acc) {
           if(acc.type === 'revenue') totalRev += (l.credit - l.debit);
@@ -390,6 +475,360 @@ app.get('/api/reports/balance-sheet', async (c) => {
 
     return c.json({ success: true, assets, liabilities, equity, totalAssets, totalLiabEquity });
   } catch (e) { return c.json({ success: false, error: e.message }, 500); }
+});
+
+// ==================== COMPANY REGISTRATION SYSTEM ====================
+// Pendaftaran syarikat dengan code unik + service charges + payment tracking
+// (paid/unpaid, billing bulanan/tahunan)
+
+function genUUID() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : ((r & 0x3) | 0x8);
+    return v.toString(16);
+  });
+}
+
+function genCompanyCode(name) {
+  // Kod unik ringkas: 2 huruf dari nama + 6 aksara rawak
+  const letters = (name || 'CO').replace(/[^A-Za-z]/g, '').toUpperCase().slice(0, 2).padEnd(2, 'X');
+  let rand = '';
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  for (let i = 0; i < 6; i++) rand += chars.charAt(Math.floor(Math.random() * chars.length));
+  return letters + rand;
+}
+
+async function uniqueCompanyCode(db, name) {
+  for (let i = 0; i < 10; i++) {
+    const code = genCompanyCode(name);
+    const exists = await db.prepare('SELECT id FROM companies WHERE code = ?').bind(code).first();
+    if (!exists) return code;
+  }
+  return genUUID().slice(0, 8).toUpperCase();
+}
+
+// ---- Companies ----
+
+app.get('/api/companies', async (c) => {
+  try {
+    const { results } = await c.env.DB.prepare(`
+      SELECT c.*,
+        (SELECT COUNT(*) FROM company_services s WHERE s.company_id = c.id) AS service_count,
+        (SELECT COALESCE(SUM(p.amount), 0) FROM service_payments p WHERE p.company_id = c.id AND p.status = 'paid') AS total_paid,
+        (SELECT COALESCE(SUM(p.amount), 0) FROM service_payments p WHERE p.company_id = c.id AND p.status = 'unpaid') AS total_unpaid
+      FROM companies c ORDER BY c.created_at DESC, c.name ASC
+    `).all();
+    return c.json({ success: true, data: results });
+  } catch (e) { return c.json({ success: false, error: e.message }, 500); }
+});
+
+app.get('/api/companies/:code', async (c) => {
+  try {
+    const code = c.req.param('code');
+    const company = await c.env.DB.prepare('SELECT * FROM companies WHERE code = ? OR id = ?').bind(code, code).first();
+    if (!company) return c.json({ success: false, error: 'Syarikat tidak dijumpai' }, 404);
+    return c.json({ success: true, data: company });
+  } catch (e) { return c.json({ success: false, error: e.message }, 500); }
+});
+
+app.post('/api/companies', async (c) => {
+  try {
+    const body = await c.req.json();
+    if (!body.name || !String(body.name).trim()) {
+      return c.json({ success: false, error: 'Nama syarikat diperlukan' }, 400);
+    }
+    const id = body.id || genUUID();
+    const code = body.code && String(body.code).trim()
+      ? String(body.code).trim()
+      : await uniqueCompanyCode(c.env.DB, body.name);
+
+    const dup = await c.env.DB.prepare('SELECT id FROM companies WHERE code = ?').bind(code).first();
+    if (dup) return c.json({ success: false, error: 'Kod syarikat sudah digunakan: ' + code }, 409);
+
+    await c.env.DB.prepare(`
+      INSERT INTO companies (id, code, name, type, tax_rate, address, phone, email, status, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    `).bind(
+      id, code, String(body.name).trim(),
+      body.type || 'sdn_bhd_normal',
+      body.tax_rate !== undefined ? Number(body.tax_rate) : 24.0,
+      body.address || '', body.phone || '', body.email || '',
+      body.status || 'active'
+    ).run();
+
+    const created = await c.env.DB.prepare('SELECT * FROM companies WHERE id = ?').bind(id).first();
+    return c.json({ success: true, data: created, message: 'Syarikat berjaya didaftarkan' });
+  } catch (e) { return c.json({ success: false, error: e.message }, 500); }
+});
+
+app.put('/api/companies/:code', async (c) => {
+  try {
+    const code = c.req.param('code');
+    const body = await c.req.json();
+    const existing = await c.env.DB.prepare('SELECT * FROM companies WHERE code = ? OR id = ?').bind(code, code).first();
+    if (!existing) return c.json({ success: false, error: 'Syarikat tidak dijumpai' }, 404);
+
+    await c.env.DB.prepare(`
+      UPDATE companies SET name = ?, type = ?, tax_rate = ?, address = ?, phone = ?, email = ?, status = ?
+      WHERE id = ?
+    `).bind(
+      body.name !== undefined ? body.name : existing.name,
+      body.type !== undefined ? body.type : existing.type,
+      body.tax_rate !== undefined ? Number(body.tax_rate) : existing.tax_rate,
+      body.address !== undefined ? body.address : existing.address,
+      body.phone !== undefined ? body.phone : existing.phone,
+      body.email !== undefined ? body.email : existing.email,
+      body.status !== undefined ? body.status : existing.status,
+      existing.id
+    ).run();
+
+    const updated = await c.env.DB.prepare('SELECT * FROM companies WHERE id = ?').bind(existing.id).first();
+    return c.json({ success: true, data: updated, message: 'Maklumat syarikat dikemas kini' });
+  } catch (e) { return c.json({ success: false, error: e.message }, 500); }
+});
+
+app.delete('/api/companies/:code', async (c) => {
+  try {
+    const code = c.req.param('code');
+    const existing = await c.env.DB.prepare('SELECT * FROM companies WHERE code = ? OR id = ?').bind(code, code).first();
+    if (!existing) return c.json({ success: false, error: 'Syarikat tidak dijumpai' }, 404);
+
+    await c.env.DB.prepare('DELETE FROM service_payments WHERE company_id = ?').bind(existing.id).run();
+    await c.env.DB.prepare('DELETE FROM company_services WHERE company_id = ?').bind(existing.id).run();
+    await c.env.DB.prepare('DELETE FROM companies WHERE id = ?').bind(existing.id).run();
+
+    return c.json({ success: true, message: 'Syarikat dipadam' });
+  } catch (e) { return c.json({ success: false, error: e.message }, 500); }
+});
+
+// ---- Services ----
+
+async function resolveCompany(db, code) {
+  return db.prepare('SELECT * FROM companies WHERE code = ? OR id = ?').bind(code, code).first();
+}
+
+app.get('/api/companies/:code/services', async (c) => {
+  try {
+    const company = await resolveCompany(c.env.DB, c.req.param('code'));
+    if (!company) return c.json({ success: false, error: 'Syarikat tidak dijumpai' }, 404);
+    const { results } = await c.env.DB.prepare(
+      'SELECT * FROM company_services WHERE company_id = ? ORDER BY service_name ASC'
+    ).bind(company.id).all();
+    return c.json({ success: true, data: results });
+  } catch (e) { return c.json({ success: false, error: e.message }, 500); }
+});
+
+app.post('/api/companies/:code/services', async (c) => {
+  try {
+    const company = await resolveCompany(c.env.DB, c.req.param('code'));
+    if (!company) return c.json({ success: false, error: 'Syarikat tidak dijumpai' }, 404);
+    const body = await c.req.json();
+    if (!body.service_name || !String(body.service_name).trim()) {
+      return c.json({ success: false, error: 'Nama perkhidmatan diperlukan' }, 400);
+    }
+    const id = 'svc-' + genUUID().slice(0, 12);
+    const billing = String(body.billing_type || 'bulanan').toLowerCase();
+    await c.env.DB.prepare(`
+      INSERT INTO company_services (id, company_id, service_name, service_charge, billing_type, status, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    `).bind(
+      id, company.id, String(body.service_name).trim(),
+      Number(body.service_charge) || 0,
+      (billing === 'tahunan' || billing === 'annual') ? 'tahunan' : 'bulanan',
+      body.status || 'active'
+    ).run();
+    const created = await c.env.DB.prepare('SELECT * FROM company_services WHERE id = ?').bind(id).first();
+    return c.json({ success: true, data: created, message: 'Perkhidmatan ditambah' });
+  } catch (e) { return c.json({ success: false, error: e.message }, 500); }
+});
+
+app.put('/api/companies/:code/services/:serviceId', async (c) => {
+  try {
+    const company = await resolveCompany(c.env.DB, c.req.param('code'));
+    if (!company) return c.json({ success: false, error: 'Syarikat tidak dijumpai' }, 404);
+    const serviceId = c.req.param('serviceId');
+    const existing = await c.env.DB.prepare(
+      'SELECT * FROM company_services WHERE id = ? AND company_id = ?'
+    ).bind(serviceId, company.id).first();
+    if (!existing) return c.json({ success: false, error: 'Perkhidmatan tidak dijumpai' }, 404);
+
+    const body = await c.req.json();
+    let billing = existing.billing_type;
+    if (body.billing_type !== undefined) {
+      const b = String(body.billing_type).toLowerCase();
+      billing = (b === 'tahunan' || b === 'annual') ? 'tahunan' : 'bulanan';
+    }
+    await c.env.DB.prepare(
+      'UPDATE company_services SET service_name = ?, service_charge = ?, billing_type = ?, status = ? WHERE id = ?'
+    ).bind(
+      body.service_name !== undefined ? body.service_name : existing.service_name,
+      body.service_charge !== undefined ? Number(body.service_charge) : existing.service_charge,
+      billing,
+      body.status !== undefined ? body.status : existing.status,
+      serviceId
+    ).run();
+    const updated = await c.env.DB.prepare('SELECT * FROM company_services WHERE id = ?').bind(serviceId).first();
+    return c.json({ success: true, data: updated, message: 'Perkhidmatan dikemas kini' });
+  } catch (e) { return c.json({ success: false, error: e.message }, 500); }
+});
+
+app.delete('/api/companies/:code/services/:serviceId', async (c) => {
+  try {
+    const company = await resolveCompany(c.env.DB, c.req.param('code'));
+    if (!company) return c.json({ success: false, error: 'Syarikat tidak dijumpai' }, 404);
+    const serviceId = c.req.param('serviceId');
+    const existing = await c.env.DB.prepare(
+      'SELECT * FROM company_services WHERE id = ? AND company_id = ?'
+    ).bind(serviceId, company.id).first();
+    if (!existing) return c.json({ success: false, error: 'Perkhidmatan tidak dijumpai' }, 404);
+
+    await c.env.DB.prepare('DELETE FROM service_payments WHERE service_id = ?').bind(serviceId).run();
+    await c.env.DB.prepare('DELETE FROM company_services WHERE id = ?').bind(serviceId).run();
+    return c.json({ success: true, message: 'Perkhidmatan dipadam' });
+  } catch (e) { return c.json({ success: false, error: e.message }, 500); }
+});
+
+// ---- Payments ----
+
+app.get('/api/companies/:code/payments', async (c) => {
+  try {
+    const company = await resolveCompany(c.env.DB, c.req.param('code'));
+    if (!company) return c.json({ success: false, error: 'Syarikat tidak dijumpai' }, 404);
+    const { results } = await c.env.DB.prepare(`
+      SELECT p.*, s.service_name, s.billing_type
+      FROM service_payments p
+      LEFT JOIN company_services s ON s.id = p.service_id
+      WHERE p.company_id = ?
+      ORDER BY p.status ASC, p.due_date DESC
+    `).bind(company.id).all();
+    return c.json({ success: true, data: results });
+  } catch (e) { return c.json({ success: false, error: e.message }, 500); }
+});
+
+app.post('/api/companies/:code/payments', async (c) => {
+  try {
+    const company = await resolveCompany(c.env.DB, c.req.param('code'));
+    if (!company) return c.json({ success: false, error: 'Syarikat tidak dijumpai' }, 404);
+    const body = await c.req.json();
+    if (!body.service_id) return c.json({ success: false, error: 'Perkhidmatan diperlukan' }, 400);
+
+    const service = await c.env.DB.prepare(
+      'SELECT * FROM company_services WHERE id = ? AND company_id = ?'
+    ).bind(body.service_id, company.id).first();
+    if (!service) return c.json({ success: false, error: 'Perkhidmatan tidak dijumpai' }, 404);
+
+    const id = 'pay-' + genUUID().slice(0, 12);
+    const st = String(body.status || 'unpaid').toLowerCase();
+    const status = st === 'paid' ? 'paid' : (st === 'pending' ? 'pending' : 'unpaid');
+    await c.env.DB.prepare(`
+      INSERT INTO service_payments (id, company_id, service_id, amount, payment_date, due_date, status, notes, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    `).bind(
+      id, company.id, body.service_id,
+      body.amount !== undefined ? Number(body.amount) : service.service_charge,
+      body.payment_date || null,
+      body.due_date || null,
+      status,
+      body.notes || ''
+    ).run();
+    const created = await c.env.DB.prepare('SELECT * FROM service_payments WHERE id = ?').bind(id).first();
+    return c.json({ success: true, data: created, message: 'Rekod bayaran ditambah' });
+  } catch (e) { return c.json({ success: false, error: e.message }, 500); }
+});
+
+app.put('/api/companies/:code/payments/:paymentId', async (c) => {
+  try {
+    const company = await resolveCompany(c.env.DB, c.req.param('code'));
+    if (!company) return c.json({ success: false, error: 'Syarikat tidak dijumpai' }, 404);
+    const paymentId = c.req.param('paymentId');
+    const existing = await c.env.DB.prepare(
+      'SELECT * FROM service_payments WHERE id = ? AND company_id = ?'
+    ).bind(paymentId, company.id).first();
+    if (!existing) return c.json({ success: false, error: 'Rekod bayaran tidak dijumpai' }, 404);
+
+    const body = await c.req.json();
+    let status = existing.status;
+    if (body.status !== undefined) {
+      const s = String(body.status).toLowerCase();
+      status = s === 'paid' ? 'paid' : (s === 'pending' ? 'pending' : 'unpaid');
+    }
+    let paymentDate = body.payment_date !== undefined ? body.payment_date : existing.payment_date;
+    if (status === 'paid' && !paymentDate) paymentDate = new Date().toISOString().slice(0, 10);
+
+    await c.env.DB.prepare(`
+      UPDATE service_payments SET amount = ?, payment_date = ?, due_date = ?, status = ?, notes = ?
+      WHERE id = ?
+    `).bind(
+      body.amount !== undefined ? Number(body.amount) : existing.amount,
+      paymentDate || null,
+      body.due_date !== undefined ? body.due_date : existing.due_date,
+      status,
+      body.notes !== undefined ? body.notes : existing.notes,
+      paymentId
+    ).run();
+
+    const updated = await c.env.DB.prepare(
+      'SELECT p.*, s.service_name FROM service_payments p LEFT JOIN company_services s ON s.id = p.service_id WHERE p.id = ?'
+    ).bind(paymentId).first();
+    return c.json({ success: true, data: updated, message: 'Rekod bayaran dikemas kini' });
+  } catch (e) { return c.json({ success: false, error: e.message }, 500); }
+});
+
+app.delete('/api/companies/:code/payments/:paymentId', async (c) => {
+  try {
+    const company = await resolveCompany(c.env.DB, c.req.param('code'));
+    if (!company) return c.json({ success: false, error: 'Syarikat tidak dijumpai' }, 404);
+    const paymentId = c.req.param('paymentId');
+    const existing = await c.env.DB.prepare(
+      'SELECT * FROM service_payments WHERE id = ? AND company_id = ?'
+    ).bind(paymentId, company.id).first();
+    if (!existing) return c.json({ success: false, error: 'Rekod bayaran tidak dijumpai' }, 404);
+
+    await c.env.DB.prepare('DELETE FROM service_payments WHERE id = ?').bind(paymentId).run();
+    return c.json({ success: true, message: 'Rekod bayaran dipadam' });
+  } catch (e) { return c.json({ success: false, error: e.message }, 500); }
+});
+
+app.get('/api/companies/:code/summary', async (c) => {
+  try {
+    const company = await resolveCompany(c.env.DB, c.req.param('code'));
+    if (!company) return c.json({ success: false, error: 'Syarikat tidak dijumpai' }, 404);
+
+    const services = (await c.env.DB.prepare(
+      'SELECT * FROM company_services WHERE company_id = ? ORDER BY service_name ASC'
+    ).bind(company.id).all()).results || [];
+    const payments = (await c.env.DB.prepare(
+      'SELECT p.*, s.service_name FROM service_payments p LEFT JOIN company_services s ON s.id = p.service_id WHERE p.company_id = ?'
+    ).bind(company.id).all()).results || [];
+
+    const paid = payments.filter(p => p.status === 'paid');
+    const unpaid = payments.filter(p => p.status !== 'paid');
+    const sum = (arr) => arr.reduce((t, p) => t + (Number(p.amount) || 0), 0);
+
+    return c.json({
+      success: true,
+      data: {
+        company,
+        totals: {
+          services: services.length,
+          services_bulanan: services.filter(s => s.billing_type === 'bulanan').length,
+          services_tahunan: services.filter(s => s.billing_type === 'tahunan').length,
+          payments: payments.length,
+          payments_paid: paid.length,
+          payments_unpaid: unpaid.length,
+          total_paid: sum(paid),
+          total_unpaid: sum(unpaid),
+          monthly_recurring: services.filter(s => s.billing_type === 'bulanan').reduce((t, s) => t + (Number(s.service_charge) || 0), 0),
+          annual_recurring: services.filter(s => s.billing_type === 'tahunan').reduce((t, s) => t + (Number(s.service_charge) || 0), 0),
+        },
+      },
+    });
+  } catch (e) { return c.json({ success: false, error: e.message }, 500); }
+});
+
+// ==================== UI: COMPANY REGISTRATION PAGE ====================
+app.get('/companies', (c) => {
+  return c.html(companyPageHtml());
 });
 
 export default app;

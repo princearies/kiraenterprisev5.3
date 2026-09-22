@@ -7,3 +7,11 @@ account_id = "2c48feaf73f0023e94ead812fcb5f01e"
 binding = "DB"
 database_name = "mykira"
 database_id = "3a8ae3cc-0746-47c5-8a79-d77e695ccc16"
+
+# e-Invois database (read-only source for auto-derived journals).
+# Companies whose name matches an e-Invois seller get journals derived
+# automatically at read time — no duplicate writes into mykira.
+[[d1_databases]]
+binding = "EINVOIS"
+database_name = "einvois-db"
+database_id = "36e6ad4d-a715-4f2b-8b4a-70ecc5c05fde"
