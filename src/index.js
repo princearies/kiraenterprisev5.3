@@ -175,7 +175,20 @@ app.get('/', (c) => {
 </div>
 <div class="container">
   <div id="dashboard" class="section active">
-    <div class="card"><h2>Senarai Syarikat</h2><button class="btn" onclick="loadCompanies()">Muat Data</button><div id="companyList" style="margin-top:15px;"></div></div>
+    <div class="card">
+      <h2>Senarai Syarikat</h2>
+      <button class="btn" onclick="loadCompanies()">Muat Data</button>
+      <div id="companyDropdown" style="margin-top:15px; display:none;">
+        <div class="form-group">
+          <label>Pilih Syarikat</label>
+          <select id="dashboard_company" onchange="loadCompanyDetail(this.value)">
+            <option value="">-- Pilih Syarikat --</option>
+          </select>
+        </div>
+        <div id="companyDetail"></div>
+      </div>
+      <div id="companyList" style="margin-top:15px;"></div>
+    </div>
   </div>
   <div id="coa" class="section">
     <div class="card"><h2>Carta Akaun (Chart of Accounts)</h2><div id="coaList"></div></div>
@@ -247,12 +260,39 @@ function showSection(id) {
 async function loadCompanies() {
   const res = await fetch('/api/clients');
   const data = await res.json();
-  let html = '<table><tr><th>ID</th><th>Nama</th><th>Hasil</th><th>Belanja</th></tr>';
+
+  // Populate dropdown
+  const dropdown = document.getElementById('dashboard_company');
+  dropdown.innerHTML = '<option value="">-- Pilih Syarikat --</option>';
   data.data.forEach(c => {
-    html += '<tr><td>'+c.client_id+'</td><td>'+c.entity_name+'</td><td>RM '+Number(c.revenue).toLocaleString()+'</td><td>RM '+Number(c.expenses).toLocaleString()+'</td></tr>';
+    dropdown.innerHTML += '<option value="'+c.client_id+'">'+c.client_id+' - '+c.entity_name+'</option>';
+  });
+  document.getElementById('companyDropdown').style.display = 'block';
+  document.getElementById('companyDetail').innerHTML = '';
+
+  // Also show full table
+  let html = '<table><tr><th>ID</th><th>Nama</th><th>Jenis</th><th>Status</th><th>Hasil</th><th>Belanja</th></tr>';
+  data.data.forEach(c => {
+    html += '<tr><td>'+c.client_id+'</td><td>'+c.entity_name+'</td><td>'+(c.entity_type||'-')+'</td><td>'+(c.status||'-')+'</td><td>RM '+Number(c.revenue).toLocaleString()+'</td><td>RM '+Number(c.expenses).toLocaleString()+'</td></tr>';
   });
   html += '</table>';
   document.getElementById('companyList').innerHTML = html;
+}
+
+async function loadCompanyDetail(code) {
+  if(!code) { document.getElementById('companyDetail').innerHTML = ''; return; }
+  const res = await fetch('/api/clients');
+  const data = await res.json();
+  const company = data.data.find(c => c.client_id === code);
+  if(!company) return;
+
+  let html = '<div class="grid-2" style="margin-top:15px;">';
+  html += '<div class="stat-box"><h3>'+company.entity_name+'</h3><p>'+company.client_id+'</p></div>';
+  html += '<div class="stat-box"><h3>Revenue (Hasil)</h3><p>RM '+Number(company.revenue).toLocaleString()+'</p></div>';
+  html += '<div class="stat-box"><h3>Expenses (Belanja)</h3><p>RM '+Number(company.expenses).toLocaleString()+'</p></div>';
+  html += '<div class="stat-box"><h3>Status</h3><p>'+(company.status||'-')+'</p></div>';
+  html += '</div>';
+  document.getElementById('companyDetail').innerHTML = html;
 }
 
 function loadCOA() {
