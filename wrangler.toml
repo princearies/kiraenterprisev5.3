@@ -1,6 +1,7 @@
 name = "kiraenterprisev5-3"
 main = "src/index.js"
 compatibility_date = "2024-09-18"
+account_id = "2c48feaf73f0023e94ead812fcb5f01e"
 
 [[d1_databases]]
 binding = "DB"
