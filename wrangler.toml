@@ -1,11 +1,17 @@
 name = "kiraenterprisev5-3"
 main = "src/index.js"
 compatibility_date = "2024-09-18"
+account_id = "2c48feaf73f0023e94ead812fcb5f01e"
 
 # ============================================================
-#  D1 CONSOLIDATION (24 Okt 2026)
-#  mykira (4037f2cd… TIDAK WUJUD) + einvois-db  digabung ke
-#  D1 terpusat mykira-platform. Data dummy dipindah & disahkan.
+#  D1 CONSOLIDATION (24 Okt 2026) — keputusan: kekalkan platform
+#  Konflik merge dengan origin/main (22 Sep) diselesaikan memihak
+#  kepada konsolidasi: kod baharu dari remote dikekalkan, manakala
+#  binding kekal menuju D1 terpusat.
+#
+#  mykira (4037f2cd… TIDAK WUJUD lagi) + einvois-db digabung ke
+#  mykira-platform. Data dummy dipindah & disahkan (22 invois,
+#  116 entri jurnal, 8 syarikat, 5 klien, 116 chart of accounts).
 #  D1 lama KEKAL sebagai sandaran sehingga worker stabil 2-3 hari.
 # ============================================================
 [[d1_databases]]
@@ -18,4 +24,3 @@ database_id = "e8ea37f6-5be1-4b8d-bdb0-2dbc04ec4841"
 binding = "EINVOIS"
 database_name = "mykira-platform"
 database_id = "e8ea37f6-5be1-4b8d-bdb0-2dbc04ec4841"
-
